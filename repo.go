@@ -738,6 +738,15 @@ func (repo *Repo) index0(memo string, context map[string]interface{}) (ret *enti
 			return
 		}
 
+		putFileErr := repo.store.PutFile(file)
+
+		if nil != putFileErr {
+			workerErrLock.Lock()
+			workerErrs = append(workerErrs, putFileErr)
+			workerErrLock.Unlock()
+			return
+		}
+
 		if 1 > len(file.Chunks) {
 			workerErrLock.Lock()
 			putErr = fmt.Errorf("file [%s, %s, %s, %d] has no chunks", file.ID, file.Path, time.UnixMilli(file.Updated).Format("2006-01-02 15:04:05"), file.Size)
@@ -845,54 +854,66 @@ func (repo *Repo) relPath(absPath string) string {
 }
 
 func (repo *Repo) putFileChunks(file *entity.File, context map[string]interface{}, count, total int) (err error) {
-	absPath := repo.absPath(file.Path)
+	chunks, err := repo.createChunks(file, chunker.MinSize, chunker.MaxSize)
 
-	if chunker.MinSize > file.Size {
-		var data []byte
-		data, err = filelock.ReadFile(absPath)
-		if nil != err {
-			logging.LogErrorf("read file [%s] failed: %s", absPath, err)
-			return
-		}
-
-		chunkHash := util.Hash(data)
-		file.Chunks = append(file.Chunks, chunkHash)
-		chunk := &entity.Chunk{ID: chunkHash, Data: data}
+	for _, chunk := range chunks {
+		file.Chunks = append(file.Chunks, chunk.ID)
 		if err = repo.store.PutChunk(chunk); nil != err {
-			logging.LogErrorf("put chunk [%s] failed: %s", chunkHash, err)
+			logging.LogErrorf("put chunk [%s] failed: %s", chunk.ID, err)
 			return
 		}
 
-		newInfo, statErr := os.Stat(absPath)
-		if nil != statErr {
-			logging.LogErrorf("stat file [%s] failed: %s", absPath, statErr)
-			err = statErr
-			return
-		}
+	}
 
-		newSize := newInfo.Size()
-		newUpdated := newInfo.ModTime().Unix()
-		if file.Size != newSize || file.SecUpdated() != newUpdated {
-			logging.LogErrorf("file changed [%s], size [%d -> %d], updated [%d -> %d]", absPath, file.Size, newSize, file.SecUpdated(), newUpdated)
-			err = ErrIndexFileChanged
-			return
-		}
+	newSize, newUpdated, infoErr := repo.getFileNewInfo(file)
 
-		eventbus.Publish(eventbus.EvtIndexUpsertFile, context, count, total)
-		err = repo.store.PutFile(file)
-		if nil != err {
-			return
-		}
+	if nil != infoErr {
+		err = infoErr
 		return
 	}
+
+	// 判断文件是否在 put chunk 期间更新
+	if file.Size != newSize || file.SecUpdated() != newUpdated {
+		err = ErrIndexFileChanged
+		return
+	}
+
+	eventbus.Publish(eventbus.EvtIndexUpsertFile, context, count, total)
+
+	return
+}
+
+func (repo *Repo) createChunks(file *entity.File, minSize, maxSize uint) (chunks []*entity.Chunk, err error) {
+	absPath := repo.absPath(file.Path)
+	chunks = make([]*entity.Chunk, 0)
 
 	reader, err := filelock.OpenFile(absPath, os.O_RDONLY, 0644)
 	if nil != err {
 		logging.LogErrorf("open file [%s] failed: %s", absPath, err)
 		return
 	}
+	defer func() {
+		if closeErr := filelock.CloseFile(reader); nil != closeErr {
+			logging.LogErrorf("close file [%s] failed: %s", absPath, closeErr)
+			return
+		}
+	}()
 
-	chnkr := chunker.NewWithBoundaries(reader, repo.chunkPol, chunker.MinSize, chunker.MaxSize)
+	// minSize 需要小于 1<<63 - 1 ，防止溢出错误
+	if int64(minSize) > file.Size {
+		var data []byte
+		data, err = io.ReadAll(reader)
+		if nil != err {
+			logging.LogErrorf("read file [%s] failed: %s", absPath, err)
+			return
+		}
+
+		chunk := createChunk(data)
+		chunks = append(chunks, chunk)
+		return
+	}
+
+	chnkr := chunker.NewWithBoundaries(reader, repo.chunkPol, minSize, maxSize)
 	for {
 		buf := make([]byte, chunker.MaxSize)
 		chnk, chnkErr := chnkr.Next(buf)
@@ -902,46 +923,30 @@ func (repo *Repo) putFileChunks(file *entity.File, context map[string]interface{
 		if nil != chnkErr {
 			err = chnkErr
 			logging.LogErrorf("chunk file [%s] failed: %s", absPath, chnkErr)
-			if closeErr := filelock.CloseFile(reader); nil != closeErr {
-				logging.LogErrorf("close file [%s] failed: %s", absPath, closeErr)
-			}
 			return
 		}
-
-		chunkHash := util.Hash(chnk.Data)
-		file.Chunks = append(file.Chunks, chunkHash)
-		chunk := &entity.Chunk{ID: chunkHash, Data: chnk.Data}
-		if err = repo.store.PutChunk(chunk); nil != err {
-			logging.LogErrorf("put chunk [%s] failed: %s", chunkHash, err)
-			if closeErr := filelock.CloseFile(reader); nil != closeErr {
-				logging.LogErrorf("close file [%s] failed: %s", absPath, closeErr)
-			}
-			return
-		}
+		chunk := createChunk(chnk.Data)
+		chunks = append(chunks, chunk)
 	}
+	return
 
-	if err = filelock.CloseFile(reader); nil != err {
-		logging.LogErrorf("close file [%s] failed: %s", absPath, err)
-		return
-	}
+}
 
+func createChunk(data []byte) *entity.Chunk {
+	chunkHash := util.Hash(data)
+	return &entity.Chunk{ID: chunkHash, Data: data}
+}
+
+func (repo *Repo) getFileNewInfo(file *entity.File) (newSize, newUpdated int64, err error) {
+	absPath := repo.absPath(file.Path)
 	newInfo, statErr := os.Stat(absPath)
 	if nil != statErr {
 		logging.LogErrorf("stat file [%s] failed: %s", absPath, statErr)
 		err = statErr
 		return
 	}
-
-	newSize := newInfo.Size()
-	newUpdated := newInfo.ModTime().Unix()
-	if file.Size != newSize || file.SecUpdated() != newUpdated {
-		logging.LogErrorf("file changed [%s], size [%d -> %d], updated [%d -> %d]", absPath, file.Size, newSize, file.Updated, newUpdated)
-		err = ErrIndexFileChanged
-		return
-	}
-
-	eventbus.Publish(eventbus.EvtIndexUpsertFile, context, count, total)
-	err = repo.store.PutFile(file)
+	newSize = newInfo.Size()
+	newUpdated = newInfo.ModTime().Unix()
 	return
 }
 
