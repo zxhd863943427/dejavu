@@ -737,7 +737,7 @@ func (repo *Repo) index0(memo string, context map[string]interface{}) (ret *enti
 			workerErrLock.Unlock()
 			return
 		}
-
+		file.GenTrueID()
 		putFileErr := repo.store.PutFile(file)
 
 		if nil != putFileErr {

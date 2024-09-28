@@ -18,7 +18,8 @@ package entity
 
 import (
 	"bytes"
-	"strconv"
+	"fmt"
+	"strings"
 
 	"github.com/siyuan-note/dejavu/util"
 )
@@ -32,19 +33,60 @@ type File struct {
 	Chunks  []string `json:"chunks"`  // 文件分块列表
 }
 
+const (
+	TimestampIndex = 22
+	ChunkHashIndex = 32
+	IDLen          = 40
+)
+
 func NewFile(path string, size int64, updated int64) (ret *File) {
 	ret = &File{
 		Path:    path,
 		Size:    size,
 		Updated: updated,
 	}
-	buf := bytes.Buffer{}
-	buf.WriteString(ret.Path)
-	buf.WriteString(strconv.FormatInt(ret.Updated/1000, 10))
-	ret.ID = util.Hash(buf.Bytes())
+
+	ret.ID = genCheckID(ret)
 	return
 }
 
 func (f *File) SecUpdated() int64 {
 	return f.Updated / 1000
+}
+
+func genCheckID(f *File) string {
+	buf := bytes.Buffer{}
+	buf.WriteString(f.Path)
+	pathHash := util.Hash(buf.Bytes())
+
+	TimestampLen := ChunkHashIndex - TimestampIndex
+	updated := fmt.Sprintf("%0[1]*[2]x", TimestampLen, f.Updated/1000)
+
+	var builder strings.Builder
+	ChunkHashLen := IDLen - ChunkHashIndex
+	builder.WriteString(pathHash[:TimestampIndex])
+	builder.WriteString(updated[:TimestampLen])
+	builder.WriteString(fmt.Sprintf("%0[1]*[2]x", ChunkHashLen, 0))
+	return builder.String()
+}
+
+func (f *File) GenTrueID() {
+
+	prefixLen := ChunkHashIndex
+	ChunkHashLen := IDLen - ChunkHashIndex
+
+	buf3 := bytes.Buffer{}
+	// slices.SortFunc(f.Chunks, func(a, b string) int {
+	// 	return strings.Compare(a, b)
+	// })
+
+	for _, chunk := range f.Chunks {
+		buf3.WriteString(chunk)
+	}
+	chunkHash := util.Hash(buf3.Bytes())
+
+	var builder strings.Builder
+	builder.WriteString(f.ID[:prefixLen])
+	builder.WriteString(chunkHash[:ChunkHashLen])
+	f.ID = builder.String()
 }
