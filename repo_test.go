@@ -18,13 +18,16 @@ package dejavu
 
 import (
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/88250/gulu"
 	"github.com/siyuan-note/dejavu/entity"
+	"github.com/siyuan-note/dejavu/util"
 	"github.com/siyuan-note/encryption"
 	"github.com/siyuan-note/eventbus"
 )
@@ -193,4 +196,126 @@ func initIndex(t *testing.T) (repo *Repo, index *entity.Index) {
 
 func ignoreLines() []string {
 	return []string{"bar"}
+}
+
+func TestCheckoutAndCompare(t *testing.T) {
+	clearTestdata(t)
+	subscribeEvents(t)
+
+	// 初始化并创建一个 index
+	repo, index := initIndex(t)
+
+	// 检出到新的文件夹
+	testCheckoutPath := filepath.FromSlash(testDataCheckoutPath)
+	originPath := filepath.FromSlash(testDataPath)
+	if err := os.MkdirAll(testCheckoutPath, 0755); err != nil {
+		t.Fatalf("mkdir failed: %s", err)
+	}
+
+	aesKey := repo.store.AesKey
+	repoCheckout, err := NewRepo(testCheckoutPath, testRepoPath, testHistoryPath, testTempPath, deviceID, deviceName, deviceOS, aesKey, ignoreLines(), nil)
+	if err != nil {
+		t.Fatalf("new repo failed: %s", err)
+	}
+	_, _, err = repoCheckout.Checkout(index.ID, map[string]interface{}{})
+	if err != nil {
+		t.Fatalf("checkout failed: %s", err)
+	}
+
+	// 比对原有文件夹和新检出文件夹中的文件
+	origFiles := getFilesWithRoot(originPath)
+	checkoutFiles := getFilesWithRoot(testCheckoutPath)
+
+	origFileSet := make(map[string]struct{})
+	checkoutFileSet := make(map[string]struct{})
+	filepath.Join(testCheckoutPath)
+
+	for _, file := range origFiles {
+		origFileSet[file] = struct{}{}
+	}
+	for _, file := range checkoutFiles {
+		checkoutFileSet[file] = struct{}{}
+	}
+
+	// 检查文件数量
+	if len(origFiles) != len(checkoutFiles) {
+		t.Logf("File count mismatch: expected %d, got %d", len(origFiles), len(checkoutFiles))
+
+		// 找到缺失的文件
+		var missingFiles []string
+		for origFile := range origFileSet {
+			if _, exists := checkoutFileSet[origFile]; !exists {
+				missingFiles = append(missingFiles, origFile)
+			}
+		}
+
+		// 找到多出的文件
+		var extraFiles []string
+		for checkoutFile := range checkoutFileSet {
+			if _, exists := origFileSet[checkoutFile]; !exists {
+				extraFiles = append(extraFiles, checkoutFile)
+			}
+		}
+
+		if len(missingFiles) > 0 {
+			t.Logf("Missing files in checkout: %v", missingFiles)
+		}
+		if len(extraFiles) > 0 {
+			t.Logf("Extra files in checkout: %v", extraFiles)
+		}
+
+		t.Fatalf("File count mismatch detected!")
+	}
+
+	for _, origFile := range origFiles {
+		checkoutFilePath := filepath.Join(testCheckoutPath, origFile)
+		originFilePath := filepath.Join(originPath, origFile)
+		if !gulu.File.IsExist(checkoutFilePath) {
+			t.Fatalf("file %s not found in checkout", checkoutFilePath)
+		}
+		if !gulu.File.IsExist(originFilePath) {
+			t.Fatalf("file %s not found in checkout", originFilePath)
+		}
+
+		origHash, err := computeFileHash(originFilePath)
+		if err != nil {
+			t.Fatalf("failed to compute hash for %s: %s", origFile, err)
+		}
+		checkoutHash, err := computeFileHash(checkoutFilePath)
+		if err != nil {
+			t.Fatalf("failed to compute hash for %s: %s", checkoutFilePath, err)
+		}
+
+		if origHash != checkoutHash {
+			t.Fatalf("file hash mismatch for %s: original hash %s, checkout hash %s", filepath.Base(origFile), origHash, checkoutHash)
+		}
+	}
+}
+
+func getFilesWithRoot(dir string) []string {
+	var files []string
+	_ = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			files = append(files, strings.Replace(path, dir, "", 1))
+		}
+		return nil
+	})
+	return files
+}
+
+func computeFileHash(filePath string) (string, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+
+	data, err := io.ReadAll(file)
+	if err != nil {
+		return "", err
+	}
+	return util.Hash(data), err
 }
